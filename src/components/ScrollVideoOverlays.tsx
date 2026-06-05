@@ -178,7 +178,9 @@ function OverlayBeat({ beat }: { beat: Beat }) {
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const track = el.closest<HTMLElement>("[data-scroll-track]");
+    // The overlays render in their own fixed layer (not inside the track), so
+    // find the scroll track globally rather than via closest().
+    const track = document.querySelector<HTMLElement>("[data-scroll-track]");
     if (!track) return;
 
     gsap.registerPlugin(ScrollTrigger);
@@ -197,7 +199,8 @@ function OverlayBeat({ beat }: { beat: Beat }) {
       trigger: track,
       start: "top top",
       end: "bottom bottom",
-      scrub: true,
+      scrub: 0.6,
+      invalidateOnRefresh: true,
       onUpdate: (self) => {
         const p = self.progress;
         let opacity: number;

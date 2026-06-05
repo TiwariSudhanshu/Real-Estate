@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import gsap from "gsap";
 import { ScrollTrigger } from "gsap/ScrollTrigger";
 import Lenis from "lenis";
@@ -8,11 +8,18 @@ import manifest from "@/../public/frames/manifest.json";
 import { OverlaySections } from "./ScrollVideoOverlays";
 
 /**
- * Scroll-scrubbed cinematic canvas player.
+ * Apple-style scroll-scrubbed cinematic canvas player.
  *
- * Frames are pre-extracted WebP images (see scripts/extract-frames.mjs). At
- * runtime we preload them into Image objects and paint the correct one to a
- * <canvas> based on ScrollTrigger progress. The source .webm is never loaded.
+ * Architecture (the part that makes it butter-smooth):
+ *  - The canvas is a single FIXED, full-screen layer. It never moves; only its
+ *    pixels change. A separate tall spacer supplies the scroll distance, so
+ *    there is no GSAP element-pinning to fight with.
+ *  - Frames are pre-extracted WebP images (scripts/extract-frames.mjs). We
+ *    DECODE each one (img.decode()) before treating it as drawable so drawImage
+ *    never stalls the main thread mid-scroll.
+ *  - A GSAP ScrollTrigger with `scrub` animates a single numeric proxy
+ *    (frame.n). On every tick we draw the rounded current frame. scrub gives
+ *    the inertia; decoded frames give the smoothness.
  */
 
 const MOBILE_BREAKPOINT = 768;
@@ -25,7 +32,6 @@ function pickSet(width: number): DeviceSet {
 }
 
 function framePath(set: DeviceSet, i: number): string {
-  // 1-based, zero-padded to 4 digits — frame_0001.webp
   return `/frames/${set}/frame_${String(i + 1).padStart(4, "0")}.webp`;
 }
 
@@ -34,31 +40,26 @@ interface ScrollVideoProps {
   trackVh?: number;
 }
 
-export default function ScrollVideo({ trackVh = 400 }: ScrollVideoProps) {
+export default function ScrollVideo({ trackVh = 500 }: ScrollVideoProps) {
   const { count } = manifest;
 
   const trackRef = useRef<HTMLDivElement>(null);
-  const pinRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Loaded Image objects for the active device set.
-  const imagesRef = useRef<HTMLImageElement[]>([]);
+  // Decoded frames for the active device set (ImageBitmap is fastest to draw;
+  // we fall back to HTMLImageElement if createImageBitmap is unavailable).
+  const framesRef = useRef<(ImageBitmap | HTMLImageElement | undefined)[]>([]);
   const currentSetRef = useRef<DeviceSet | null>(null);
   const lastDrawnRef = useRef<number>(-1);
-  const rafRef = useRef<number | null>(null);
+  const frameStateRef = useRef({ n: 0 }); // the value GSAP scrubs
 
-  const [loadProgress, setLoadProgress] = useState(0); // 0..1
-  const [ready, setReady] = useState(false);
-  // Lazy init reads the media query once on the client (SSR renders false, then
-  // hydration corrects it) so the effect only needs to subscribe to changes —
-  // no setState in the effect body.
+  const [firstReady, setFirstReady] = useState(false); // first frame drawable
   const [reducedMotion, setReducedMotion] = useState(
     () =>
       typeof window !== "undefined" &&
       window.matchMedia("(prefers-reduced-motion: reduce)").matches
   );
 
-  // --- prefers-reduced-motion: subscribe to changes ---
   useEffect(() => {
     const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
     const onChange = (e: MediaQueryListEvent) => setReducedMotion(e.matches);
@@ -66,113 +67,98 @@ export default function ScrollVideo({ trackVh = 400 }: ScrollVideoProps) {
     return () => mq.removeEventListener("change", onChange);
   }, []);
 
-  /**
-   * Draw a frame to the canvas with object-fit: cover semantics:
-   * scale to fill the viewport, center-crop the overflow, never distort.
-   */
-  const drawFrame = useCallback((index: number) => {
+  // ---------------------------------------------------------------------------
+  // Drawing — object-fit: cover, DPR-capped. Pure, reads from refs only.
+  // ---------------------------------------------------------------------------
+  function draw(index: number, force = false) {
     const canvas = canvasRef.current;
-    const img = imagesRef.current[index];
-    if (!canvas || !img || !img.complete || img.naturalWidth === 0) return;
+    if (!canvas) return;
+    const clamped = Math.max(0, Math.min(count - 1, index));
+    if (!force && clamped === lastDrawnRef.current) return;
+
+    const frame = framesRef.current[clamped];
+    if (!frame) return; // not decoded yet — leave previous frame on screen
+
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
     const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
-    const cssW = canvas.clientWidth;
-    const cssH = canvas.clientHeight;
-
-    // Resize backing store only when it actually changes (cheap to check).
-    const pxW = Math.round(cssW * dpr);
-    const pxH = Math.round(cssH * dpr);
+    const pxW = Math.round(canvas.clientWidth * dpr);
+    const pxH = Math.round(canvas.clientHeight * dpr);
     if (canvas.width !== pxW || canvas.height !== pxH) {
       canvas.width = pxW;
       canvas.height = pxH;
     }
 
-    const iw = img.naturalWidth;
-    const ih = img.naturalHeight;
-    // cover: scale so the image fully covers the canvas, crop the rest.
+    const iw = "width" in frame ? frame.width : (frame as HTMLImageElement).naturalWidth;
+    const ih = "height" in frame ? frame.height : (frame as HTMLImageElement).naturalHeight;
     const scale = Math.max(pxW / iw, pxH / ih);
     const dw = iw * scale;
     const dh = ih * scale;
     const dx = (pxW - dw) / 2;
     const dy = (pxH - dh) / 2;
 
-    ctx.clearRect(0, 0, pxW, pxH);
-    ctx.drawImage(img, dx, dy, dw, dh);
-    lastDrawnRef.current = index;
-  }, []);
+    ctx.drawImage(frame as CanvasImageSource, dx, dy, dw, dh);
+    lastDrawnRef.current = clamped;
+  }
 
-  /** Schedule a draw on the next animation frame, coalescing redundant calls. */
-  const scheduleDraw = useCallback(
-    (index: number) => {
-      if (index === lastDrawnRef.current) return;
-      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
-      rafRef.current = requestAnimationFrame(() => {
-        rafRef.current = null;
-        drawFrame(index);
-      });
-    },
-    [drawFrame]
-  );
-
-  // --- Preload frames for the current device set, then mark ready. ---
-  // Re-runs when crossing the breakpoint so we swap to the matching resolution.
+  // ---------------------------------------------------------------------------
+  // Load + decode a device set. Decodes frame 0 first so we paint instantly,
+  // then streams the rest in order. The experience starts as soon as frame 0
+  // is ready — no waiting for the whole set.
+  // ---------------------------------------------------------------------------
   useEffect(() => {
     let cancelled = false;
 
-    function loadSet(set: DeviceSet) {
-      currentSetRef.current = set;
-      lastDrawnRef.current = -1;
-      setReady(false);
-      setLoadProgress(0);
-
-      const images: HTMLImageElement[] = new Array(count);
-      imagesRef.current = images;
-      let loaded = 0;
-      let firstDrawn = false;
-
-      const midpoint = Math.floor(count / 2);
-
-      const onOne = (i: number) => {
+    async function decodeOne(set: DeviceSet, i: number) {
+      try {
+        const res = await fetch(framePath(set, i));
+        const blob = await res.blob();
         if (cancelled || currentSetRef.current !== set) return;
-        loaded += 1;
-        setLoadProgress(loaded / count);
-
-        // Paint the first available frame ASAP so we have something on screen
-        // (helps LCP) rather than waiting for the whole set.
-        if (!firstDrawn) {
-          firstDrawn = true;
-          const startIndex = reducedMotion ? midpoint : 0;
-          if (images[startIndex]?.complete) scheduleDraw(startIndex);
-          else scheduleDraw(i);
+        if ("createImageBitmap" in window) {
+          framesRef.current[i] = await createImageBitmap(blob);
+        } else {
+          const img = new Image();
+          img.src = URL.createObjectURL(blob);
+          await img.decode().catch(() => {});
+          framesRef.current[i] = img;
         }
-
-        if (loaded >= count) {
-          setReady(true);
-          // Ensure the correct starting frame is shown.
-          drawFrame(reducedMotion ? midpoint : 0);
-        }
-      };
-
-      for (let i = 0; i < count; i++) {
-        const img = new Image();
-        // Prioritize the very first frame for fast first paint.
-        if (i === 0) {
-          img.fetchPriority = "high";
-          img.loading = "eager";
-        }
-        img.onload = () => onOne(i);
-        img.onerror = () => onOne(i); // don't deadlock the loader on a bad frame
-        img.src = framePath(set, i);
-        images[i] = img;
+      } catch {
+        // skip a bad frame; never deadlock the loader
       }
     }
 
-    const set = pickSet(window.innerWidth);
-    loadSet(set);
+    async function loadSet(set: DeviceSet) {
+      currentSetRef.current = set;
+      lastDrawnRef.current = -1;
+      framesRef.current = new Array(count);
+      setFirstReady(false);
 
-    // Swap sets when crossing the breakpoint.
+      const startIndex = reducedMotion ? Math.floor(count / 2) : 0;
+
+      // 1. Decode the starting frame first and paint it immediately.
+      await decodeOne(set, startIndex);
+      if (cancelled || currentSetRef.current !== set) return;
+      draw(startIndex, true);
+      frameStateRef.current.n = startIndex;
+      setFirstReady(true);
+
+      // 2. Stream the rest, in scroll order, a few in flight at a time.
+      const CONCURRENCY = 6;
+      const queue: number[] = [];
+      for (let i = 0; i < count; i++) if (i !== startIndex) queue.push(i);
+
+      async function worker() {
+        while (queue.length && !cancelled && currentSetRef.current === set) {
+          const i = queue.shift()!;
+          await decodeOne(set, i);
+        }
+      }
+      await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+    }
+
+    loadSet(pickSet(window.innerWidth));
+
     let resizeRaf: number | null = null;
     const onResize = () => {
       if (resizeRaf != null) cancelAnimationFrame(resizeRaf);
@@ -182,8 +168,8 @@ export default function ScrollVideo({ trackVh = 400 }: ScrollVideoProps) {
         if (next !== currentSetRef.current) {
           loadSet(next);
         } else {
-          // Same set: just repaint at current size/frame.
-          drawFrame(lastDrawnRef.current >= 0 ? lastDrawnRef.current : 0);
+          draw(lastDrawnRef.current >= 0 ? lastDrawnRef.current : 0, true);
+          ScrollTrigger.refresh();
         }
       });
     };
@@ -194,117 +180,113 @@ export default function ScrollVideo({ trackVh = 400 }: ScrollVideoProps) {
       window.removeEventListener("resize", onResize);
       if (resizeRaf != null) cancelAnimationFrame(resizeRaf);
     };
-    // reducedMotion affects the starting frame; re-run if it flips.
-  }, [count, reducedMotion, drawFrame, scheduleDraw]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [count, reducedMotion]);
 
-  // --- Scroll wiring: Lenis + ScrollTrigger. Skipped under reduced motion. ---
+  // ---------------------------------------------------------------------------
+  // Scroll wiring — Lenis + a scrubbed numeric proxy. Skipped under reduced motion.
+  // ---------------------------------------------------------------------------
   useEffect(() => {
-    if (reducedMotion || !ready) return;
-    if (typeof window === "undefined") return;
+    if (reducedMotion || !firstReady) return;
 
     gsap.registerPlugin(ScrollTrigger);
 
-    const lenis = new Lenis();
+    const lenis = new Lenis({ lerp: 0.1 });
     lenis.on("scroll", ScrollTrigger.update);
-
-    const tickerCb = (time: number) => {
-      // gsap ticker time is in seconds; lenis.raf wants milliseconds.
-      lenis.raf(time * 1000);
-    };
+    const tickerCb = (time: number) => lenis.raf(time * 1000);
     gsap.ticker.add(tickerCb);
     gsap.ticker.lagSmoothing(0);
 
-    const st = ScrollTrigger.create({
-      trigger: trackRef.current,
-      start: "top top",
-      end: "bottom bottom",
-      pin: pinRef.current,
-      pinSpacing: false, // the track itself supplies the scroll distance
-      scrub: 1,
-      onUpdate: (self) => {
-        const index = Math.min(
-          count - 1,
-          Math.round(self.progress * (count - 1))
-        );
-        scheduleDraw(index);
+    const state = frameStateRef.current;
+
+    // Animate the frame number across the whole track, scrubbed. We draw on
+    // every tick (onUpdate of the tween) so the canvas tracks the eased value,
+    // not the raw scroll position — this is what reads as "video playback".
+    const tween = gsap.to(state, {
+      n: count - 1,
+      ease: "none",
+      scrollTrigger: {
+        trigger: trackRef.current,
+        start: "top top",
+        end: "bottom bottom",
+        scrub: 0.6,
+        invalidateOnRefresh: true,
       },
+      onUpdate: () => draw(Math.round(state.n)),
     });
 
-    // First paint at current scroll position.
-    drawFrame(
-      Math.min(count - 1, Math.round((st.progress || 0) * (count - 1)))
-    );
+    draw(Math.round(state.n), true);
     ScrollTrigger.refresh();
 
     return () => {
-      st.kill();
+      tween.scrollTrigger?.kill();
+      tween.kill();
       gsap.ticker.remove(tickerCb);
       lenis.destroy();
     };
-  }, [ready, reducedMotion, count, drawFrame, scheduleDraw]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [firstReady, reducedMotion, count]);
 
-  // --- Reduced motion: paint a single static midpoint frame once ready. ---
+  // Reduced motion: keep a static midpoint frame painted across resizes.
   useEffect(() => {
-    if (!reducedMotion || !ready) return;
-    drawFrame(Math.floor(count / 2));
-    const onResize = () => drawFrame(Math.floor(count / 2));
+    if (!reducedMotion || !firstReady) return;
+    const mid = Math.floor(count / 2);
+    draw(mid, true);
+    const onResize = () => draw(mid, true);
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
-  }, [reducedMotion, ready, count, drawFrame]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reducedMotion, firstReady, count]);
 
   // ---------------------------------------------------------------------------
-  // Reduced-motion layout: static frame + sections stacked as a normal page.
+  // Render
   // ---------------------------------------------------------------------------
+
+  // Fixed, full-screen canvas layer shared by both modes.
+  const canvasLayer = (
+    <div className="fixed inset-0 z-0 h-svh w-full bg-black">
+      <canvas ref={canvasRef} className="block h-full w-full" />
+      {!firstReady && <Loader />}
+    </div>
+  );
+
   if (reducedMotion) {
     return (
       <section className="relative w-full">
-        <div className="sticky top-0 h-screen w-full overflow-hidden bg-black">
-          <canvas ref={canvasRef} className="block h-full w-full" />
-          {!ready && <Loader progress={loadProgress} />}
+        {canvasLayer}
+        <div className="relative z-10">
+          <OverlaySections reducedMotion />
         </div>
-        <OverlaySections reducedMotion />
       </section>
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // Scrubbed layout: tall track pins the canvas while overlays cross-fade.
-  // ---------------------------------------------------------------------------
   return (
-    <section
-      ref={trackRef}
-      data-scroll-track
-      className="relative w-full"
-      style={{ height: `${trackVh}vh` }}
-    >
-      <div
-        ref={pinRef}
-        className="relative left-0 top-0 h-screen w-full overflow-hidden bg-black"
-      >
-        <canvas ref={canvasRef} className="block h-full w-full" />
-        {!ready && <Loader progress={loadProgress} />}
+    <>
+      {canvasLayer}
+      {/* Overlays sit fixed over the canvas; the spacer below drives scroll. */}
+      <div className="pointer-events-none fixed inset-0 z-10 h-svh w-full">
         <OverlaySections />
       </div>
-    </section>
+      {/* Tall scroll track — the only thing that actually scrolls here. */}
+      <section
+        ref={trackRef}
+        data-scroll-track
+        className="relative z-0 w-full"
+        style={{ height: `${trackVh}vh` }}
+        aria-hidden
+      />
+    </>
   );
 }
 
-function Loader({ progress }: { progress: number }) {
-  const pct = Math.round(progress * 100);
+function Loader() {
   return (
-    <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-black text-white">
-      <div className="mb-4 text-sm font-light tracking-[0.3em] text-white/60">
-        LOADING
+    <div className="pointer-events-none absolute inset-0 z-30 flex flex-col items-center justify-center bg-black text-white">
+      <div className="mb-4 text-[0.7rem] font-light uppercase tracking-[0.4em] text-white/50">
+        Loading
       </div>
-      <div className="text-4xl font-extralight tabular-nums tracking-tight">
-        {pct}%
-      </div>
-      <div className="mt-6 h-px w-40 overflow-hidden bg-white/15">
-        <div
-          className="h-full bg-white/80 transition-[width] duration-200 ease-out"
-          style={{ width: `${pct}%` }}
-        />
-      </div>
+      <div className="h-5 w-5 animate-spin rounded-full border border-white/20 border-t-white/80" />
     </div>
   );
 }

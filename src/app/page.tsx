@@ -3,14 +3,14 @@ import ScrollVideo from "@/components/ScrollVideo";
 export default function Home() {
   return (
     <main className="w-full bg-black text-white">
-      {/* Pinned, scroll-scrubbed cinematic walkthrough */}
-      <ScrollVideo trackVh={400} />
+      {/* Fixed full-screen scroll-scrubbed cinematic walkthrough + its scroll track */}
+      <ScrollVideo trackVh={500} />
 
       {/* ===================================================================
-          After the pin releases: normal page flow.
-          This proves the canvas unpins cleanly and the page scrolls on.
+          After the track ends: normal page flow. This sits in a solid,
+          relatively-positioned layer that scrolls up OVER the fixed canvas.
           =================================================================== */}
-
+      <div className="relative z-10 bg-black">
       {/* EDIT COPY — Property details / spec list */}
       <section className="mx-auto w-full max-w-5xl px-8 py-28 sm:py-36">
         <p className="mb-4 text-xs font-medium uppercase tracking-[0.35em] text-white/40">
@@ -68,6 +68,7 @@ export default function Home() {
           <span>© {new Date().getFullYear()} — All rights reserved</span>
         </div>
       </footer>
+      </div>
     </main>
   );
 }
